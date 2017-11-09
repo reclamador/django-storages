@@ -11,6 +11,11 @@ django-storages
     :target: https://travis-ci.org/jschneier/django-storages
     :alt: Build Status
 
+Improvement
+===========
+It includes Google Drive and Microsoft OneDrive backends (WIP)
+
+
 Installation
 ============
 Installing from PyPI is as easy as doing::

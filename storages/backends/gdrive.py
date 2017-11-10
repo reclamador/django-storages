@@ -6,42 +6,40 @@
 #
 # Add below to settings.py:
 # GDRIVE_PKEY_FILE_PATH = '/path/to/private/key/file'
-# GDRIVE_PKEY_PASSWORD = 'notasecret'
 # GDRIVE_CLIENT_EMAIL = 'whatever@developer.gserviceaccount.com'
 
 from __future__ import absolute_import
 
-from datetime import datetime
-from shutil import copyfileobj
-from tempfile import SpooledTemporaryFile
 import os
 import json
-from mimetypes import MimeTypes
+import tempfile
+from contextlib import contextmanager
 
-from apiclient import discovery
-from googleapiclient.errors import HttpError
-from oauth2client.service_account import ServiceAccountCredentials
+from pydrive.auth import GoogleAuth
+from pydrive.drive import GoogleDrive
 
-import httplib2
-
-
-from django.core.exceptions import ImproperlyConfigured
 from django.core.files.base import File
 from django.core.files.storage import Storage
 from django.utils.deconstruct import deconstructible
+from pydrive.files import ApiRequestError
 
 from storages.utils import setting
 
-VALID_MIME_TYPES_FOR_PKEY_FILE_DICT = {
-    "PKCS12": 'application/x-pkcs12',
-    "JSON": 'application/json'
-}
-VALID_EXTENSIONS_FOR_PKEY_FILE_DICT = {
-    "PKCS12": '.pkcs12',
-    "JSON": '.json'
-}
-SCOPES = ['https://www.googleapis.com/auth/drive']
-
+@contextmanager
+def tempinput(data):
+    """
+    Context Manager to build a temporary file in disk to store yaml configuration
+    Credits: https://stackoverflow.com/a/11892712/593722
+    :param data: The raw data to write to disk
+    :return:
+    """
+    temp = tempfile.NamedTemporaryFile(delete=False)
+    temp.write(data)
+    temp.close()
+    try:
+        yield temp.name
+    finally:
+        os.unlink(temp.name)
 
 class GDriveStorageException(Exception):
     pass
@@ -56,89 +54,56 @@ class GDriveFile(File):
 class GDriveStorage(Storage):
     """Google Drive Storage class for Django pluggable storage system."""
 
-    CHUNK_SIZE = 4 * 1024 * 1024
-
-    def _build_credentials_object(self, pkey_file_path, client_email=None, private_key_password=None):
-        """
-        Buils a credentials object to authenticate with Google
-        :param pkey_file_path: local path to private key file in PKCS12 or JSON format
-        :param client_email: the email associated with the service account
-        :param private_key_password: password associated with the private key (if the password exists)
-        :return: Service Account credential for OAuth 2.0 signed JWT grants
-        """
-        mime = MimeTypes()
-
-        # Try to get mime type
-        (mimetype, _) = mime.guess_type(pkey_file_path)
-
-        # Not valid mimetype. Try with file extension
-        if not mimetype or mimetype.lower() not in VALID_MIME_TYPES_FOR_PKEY_FILE_DICT.values():
-            _, file_extension = os.path.splitext(pkey_file_path)
-
-            if file_extension.lower() not in VALID_EXTENSIONS_FOR_PKEY_FILE_DICT.values():
-                raise ImproperlyConfigured("You must provide a valid PKCS12 / JSON private key file")
-
-            elif file_extension.lower() == VALID_EXTENSIONS_FOR_PKEY_FILE_DICT["PKCS12"]:
-                mimetype = VALID_MIME_TYPES_FOR_PKEY_FILE_DICT["PKCS12"]
-
-            else:
-                mimetype = VALID_MIME_TYPES_FOR_PKEY_FILE_DICT["JSON"]
-
-        # File in PKCS12 format
-        if mimetype == VALID_MIME_TYPES_FOR_PKEY_FILE_DICT["PKCS12"]:
-            return ServiceAccountCredentials.from_p12_keyfile(client_email, pkey_file_path, private_key_password,
-                                                              SCOPES)
-
-        # File in JSON format
-        else:
-            return ServiceAccountCredentials.from_json_keyfile_name(pkey_file_path, SCOPES)
-
     def __init__(self, **kwargs):
         """
         Creates a service object that allows to target queries at a Google Service identified by the given parameters.
         Google Service is for Google Drive API v3: https://developers.google.com/drive/v3/web/about-sdk
         Check
         https://developers.google.com/api-client-library/python/auth/service-accounts
-        :param kwargs: optional config values. Accepted keys:
-            * create_delegated: string, email of an existent user, in case we delegated domain-wide access to the
-            service account and want to impersonate a user account
-            * supportsTeamDrives: boolean, whether the requesting application supports Team Drives
-            * acknowledgeAbuse: boolean, Whether the user is acknowledging the risk of downloading known malware or
-            other abusive files.
+        :param kwargs: key-value store with additional parameters for Google Drive API calls. Valid keys are:
+        supportsTeamDrives, acknowledgeAbuse
+        For valid values check functions's parameters at
+        https://developers.google.com/resources/api-libraries/documentation/drive/v3/python/latest/index.html
+        :type kwargs: dict
         """
         # Get configuration parameters
-        pkey_file_path = setting("GDRIVE_PKEY_FILE_PATH", None) #local path to private key file in PKCS12 or JSON format
-        client_email = setting("GDRIVE_CLIENT_EMAIL", None) # the email associated with the service account
-        private_key_password = setting("GDRIVE_PKEY_PASSWORD",
-                                       None) # password associated with the private key (if the password exists)
+        pkey_file_path = setting("GDRIVE_PKEY_FILE_PATH", strict=True) #local path to private key file in PKCS12 format
+        client_email = setting("GDRIVE_CLIENT_EMAIL", strict=True) # the email associated with the service account
 
-        delegated_email = kwargs.get("create_delegated", None)
-        support_team_drives = kwargs.get("supportsTeamDrives", None)
-        acknowledge_abuse = kwargs.get("acknowledgeAbuse", None)
+        create_delegated = kwargs.get("create_delegated", '')
+        self._supports_team_drives = kwargs.get("supportsTeamDrives", None)
+        self._acknowledge_abuse = kwargs.get("acknowledgeAbuse", None)
 
+        # Build a temporary YAML file containing expected parameters for ServiceAuth in PyDrive lib
+        yaml_content = "client_config_backend: service\n" \
+                       "service_config:\n  " \
+                       "client_user_email: {}\n  " \
+                       "client_service_email: {}\n  " \
+                       "client_pkcs12_file_path: {}\n".format(create_delegated, client_email, pkey_file_path)
 
-        # Build credentials to Google Service account auth
-        credentials = self._build_credentials_object(pkey_file_path, client_email, private_key_password)
+        # Google Drive authentication using PyDrive
+        with tempinput(yaml_content) as tempfilename:
+            gauth = GoogleAuth(settings_file=tempfilename)
+            gauth.ServiceAuth()
 
-        # If we want to impersonate another user
-        if delegated_email is not None:
-            credentials = credentials.create_delegated(delegated_email)
-
-        # Build the service object
-        http = credentials.authorize(httplib2.Http())
-        self.client = discovery.build('drive', 'v3', http=http)
-
-        # Store config parameter
-        self._support_team_drives = support_team_drives
-        self._acknowledge_abuse = acknowledge_abuse
+            # Create GoogleDrive instance with authenticated GoogleAuth instance.
+            self.drive = GoogleDrive(gauth)
 
     def delete(self, name):
-        self.client.files().delete(fileId=name, supportTeamDrives=self._support_team_drives)
+        # Build an GoogleDriveFile object with desired id
+        gdrive_file = self.drive.CreateFile(metadata={'id': name})
+
+        # Delete it
+        gdrive_file.Delete(param={"supportsTeamDrives": self._supports_team_drives})
 
     def exists(self, name):
+        # Build an GoogleDriveFile object with desired id
+        gdrive_file = self.drive.CreateFile(metadata={'id': name})
         try:
-            _ = self.client.files().get(fileId=name, acknowledgeAbuse=self._acknowledge_abuse)
-        except HttpError as e:
+            # Try to fetch its metadata
+            _ = gdrive_file.FetchMetadata()
+        except ApiRequestError as e:
+            # Could not fetch metadata: assume the file does not exist or is not accessible
             return False
         else:
             return True
@@ -149,7 +114,9 @@ class GDriveStorage(Storage):
         return directories, files
 
     def size(self, name):
-        response = self.client.files().get(fileId=name, acknowledgeAbuse=self._acknowledge_abuse, fields='size')
+        # Build an GoogleDriveFile object with desired id
+        gdrive_file = self.drive.CreateFile(metadata={'id': name})
+        response = gdrive_file.FetchMetadata(fields='size')
         gdrive_file_metadata = json.dumps(response)
 
         # Size property is only valid for binary files. Check
@@ -159,19 +126,23 @@ class GDriveStorage(Storage):
         # TODO: In case of no binary files, download it and get size directly from os
 
     def modified_time(self, name):
-        response = self.client.files().get(fileId=name, acknowledgeAbuse=self._acknowledge_abuse, fields='modifiedTime')
+        # Build an GoogleDriveFile object with desired id
+        gdrive_file = self.drive.CreateFile(metadata={'id': name})
+        response = gdrive_file.FetchMetadata(fields='modifiedDate')
         gdrive_file_metadata = json.dumps(response)
-        return gdrive_file_metadata.get("modifiedTime", None)
+        return gdrive_file_metadata.get("modifiedDate", None)
 
     def accessed_time(self, name):
-        response = self.client.files().get(fileId=name, acknowledgeAbuse=self._acknowledge_abuse,
-                                           fields='viewedByMeTime')
+        # Build an GoogleDriveFile object with desired id
+        gdrive_file = self.drive.CreateFile(metadata={'id': name})
+        response = gdrive_file.FetchMetadata(fields='lastViewedByMeDate')
         gdrive_file_metadata = json.dumps(response)
-        return gdrive_file_metadata.get("viewedByMeTime", None)
+        return gdrive_file_metadata.get("lastViewedByMeDate", None)
 
     def url(self, name):
-        response = self.client.files().get(fileId=name, acknowledgeAbuse=self._acknowledge_abuse,
-                                           fields='webContentLink')
+        # Build an GoogleDriveFile object with desired id
+        gdrive_file = self.drive.CreateFile(metadata={'id': name})
+        response = gdrive_file.FetchMetadata(fields='webContentLink')
         gdrive_file_metadata = json.dumps(response)
         return gdrive_file_metadata.get("webContentLink", None)
 

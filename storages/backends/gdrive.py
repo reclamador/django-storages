@@ -2,11 +2,27 @@
 # Author: Jorge Arevalo <jorge.arevalo@reclamador.es>
 # License: BSD
 #
+# Disclaimer:
+#
+# This storage system is created with one purpose: allow users to upload, edit and share typical office suite documents
+# using Google office suite as base.
+#
+# I'm creating it for an enterprise web application. So, the idea is to avoid manual authorization on the Google
+# accounts owners' part (typical scenario for server to server applications, two-legged OAuth). And Google thinks
+# this may be a dangerous use case. I quote Google (https://developers.google.com/drive/v2/web/about-auth)
+#
+# "Warning: Service accounts should only be used for performing delegation where the effective identity is that of an
+# individual user in a domain. Using the service account as a common owner to create many shared documents can have
+# severe performance implications. Additionally, service accounts may not acquire additional storage quota, nor do they
+# act as members of a domain."
+#
+# So... Be careful with this storage class. It's valid for my specific use case, but it might not be for yours.
+#
 # Usage:
 #
 # Add below to settings.py:
-# GDRIVE_PKEY_FILE_PATH = '/path/to/private/key/file'
-# GDRIVE_CLIENT_EMAIL = 'whatever@developer.gserviceaccount.com'
+#   GDRIVE_P12_KEYFILE_PATH = '/path/to/private/key/file.p12'
+#   GDRIVE_CLIENT_EMAIL = 'whatever@developer.gserviceaccount.com'
 
 from __future__ import absolute_import
 
@@ -57,17 +73,17 @@ class GDriveStorage(Storage):
     def __init__(self, **kwargs):
         """
         Creates a service object that allows to target queries at a Google Service identified by the given parameters.
-        Google Service is for Google Drive API v3: https://developers.google.com/drive/v3/web/about-sdk
+        Google Service is for Google Drive API v2: https://developers.google.com/drive/v2/web/about-sdk
         Check
         https://developers.google.com/api-client-library/python/auth/service-accounts
         :param kwargs: key-value store with additional parameters for Google Drive API calls. Valid keys are:
         supportsTeamDrives, acknowledgeAbuse
         For valid values check functions's parameters at
-        https://developers.google.com/resources/api-libraries/documentation/drive/v3/python/latest/index.html
+        https://developers.google.com/resources/api-libraries/documentation/drive/v2/python/latest/index.html
         :type kwargs: dict
         """
         # Get configuration parameters
-        pkey_file_path = setting("GDRIVE_PKEY_FILE_PATH", strict=True) #local path to private key file in PKCS12 format
+        pkey_file_path = setting("GDRIVE_P12_KEYFILE_PATH", strict=True) #local path to private key file in PKCS12 format
         client_email = setting("GDRIVE_CLIENT_EMAIL", strict=True) # the email associated with the service account
 
         create_delegated = kwargs.get("create_delegated", '')

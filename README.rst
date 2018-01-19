@@ -13,7 +13,7 @@ django-storages
 
 Improvement
 ===========
-It includes Google Drive and Microsoft OneDrive backends (WIP)
+WIP to provide Google Drive support (and hopefully Microsoft OneDrive)
 
 
 Installation
